@@ -31,7 +31,10 @@ jobs:
           set -Eeuo pipefail
 
           if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            draft="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" --jq '.draft')"
+            draft="$(gh release view "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json isDraft \
+              --jq '.isDraft')"
             if [[ "$draft" != "true" ]]; then
               echo "Release $RELEASE_TAG has already been published; refusing to overwrite it." >&2
               exit 1
