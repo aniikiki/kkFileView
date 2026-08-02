@@ -1,0 +1,247 @@
+name: Build and Release Docker Images v5.0.1
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: kkfileview-v5.0.1-release
+  cancel-in-progress: false
+
+env:
+  APP_VERSION: 5.0.1
+  BASE_IMAGE: keking/kkfileview-base:5.0.0
+  IMAGE_NAME: aniikiki/kkfileview
+  RELEASE_TAG: v5.0.1
+  SOURCE_SHA: e134689df3d9c6ae48749d42cc282d9920dd0813
+
+jobs:
+  prepare-release:
+    name: Prepare draft release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Create or reuse draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            draft="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" --jq '.draft')"
+            if [[ "$draft" != "true" ]]; then
+              echo "Release $RELEASE_TAG has already been published; refusing to overwrite it." >&2
+              exit 1
+            fi
+            echo "Reusing existing draft release $RELEASE_TAG."
+          else
+            gh release create "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$SOURCE_SHA" \
+              --title "kkFileView $APP_VERSION Docker images" \
+              --notes "Docker offline images for linux/amd64 and linux/arm64, built from source commit $SOURCE_SHA." \
+              --draft
+          fi
+
+  build-images:
+    name: Build ${{ matrix.platform }} image
+    needs: prepare-release
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux/amd64
+            expected_arch: amd64
+            asset_arch: x64
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            expected_arch: arm64
+            asset_arch: aarch64
+
+    steps:
+      - name: Checkout v5.0.1 source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          fetch-depth: 1
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Verify native runner architecture
+        env:
+          EXPECTED_ARCH: ${{ matrix.expected_arch }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          case "$(uname -m)" in
+            x86_64) actual_arch=amd64 ;;
+            aarch64|arm64) actual_arch=arm64 ;;
+            *) actual_arch="$(uname -m)" ;;
+          esac
+
+          if [[ "$actual_arch" != "$EXPECTED_ARCH" ]]; then
+            echo "Expected runner architecture $EXPECTED_ARCH, got $actual_arch." >&2
+            exit 1
+          fi
+
+      - name: Build server package
+        run: mvn -B -pl server -DskipTests package
+
+      - name: Build base image
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          docker build \
+            --platform "$PLATFORM" \
+            --tag "$BASE_IMAGE" \
+            docker/kkfileview-base
+
+      - name: Build application image
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          docker build \
+            --platform "$PLATFORM" \
+            --tag "$IMAGE_NAME:$APP_VERSION" \
+            .
+
+      - name: Verify image architecture
+        env:
+          EXPECTED_ARCH: ${{ matrix.expected_arch }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          actual_arch="$(docker image inspect --format '{{.Architecture}}' "$IMAGE_NAME:$APP_VERSION")"
+          if [[ "$actual_arch" != "$EXPECTED_ARCH" ]]; then
+            echo "Expected image architecture $EXPECTED_ARCH, got $actual_arch." >&2
+            exit 1
+          fi
+
+      - name: Smoke test container startup
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          container_name="kkfileview-smoke-${{ matrix.expected_arch }}"
+          docker run --detach \
+            --name "$container_name" \
+            --publish 8012:8012 \
+            "$IMAGE_NAME:$APP_VERSION"
+
+          healthy=false
+          for _ in $(seq 1 90); do
+            if curl --fail --silent --show-error \
+              http://127.0.0.1:8012/actuator/health >/dev/null; then
+              healthy=true
+              break
+            fi
+            sleep 2
+          done
+
+          if [[ "$healthy" != "true" ]]; then
+            docker logs "$container_name" || true
+            docker rm --force "$container_name" || true
+            echo "kkFileView did not become healthy within 180 seconds." >&2
+            exit 1
+          fi
+
+          docker rm --force "$container_name"
+
+      - name: Export image and checksum
+        id: export
+        env:
+          ASSET_ARCH: ${{ matrix.asset_arch }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          mkdir -p dist
+          asset="kkFileView-$APP_VERSION-docker_$ASSET_ARCH.tar"
+          docker save --output "dist/$asset" "$IMAGE_NAME:$APP_VERSION"
+          sha256sum "dist/$asset" > "dist/$asset.sha256"
+
+          size="$(stat --format='%s' "dist/$asset")"
+          if (( size <= 0 || size >= 2147483648 )); then
+            echo "Release asset size is invalid: $size bytes." >&2
+            exit 1
+          fi
+
+          echo "asset=$asset" >> "$GITHUB_OUTPUT"
+          echo "Created $asset ($size bytes)."
+
+      - name: Upload image directly to draft release
+        env:
+          ASSET: ${{ steps.export.outputs.asset }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          for attempt in 1 2 3; do
+            if gh release upload "$RELEASE_TAG" \
+              "dist/$ASSET" \
+              "dist/$ASSET.sha256" \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber; then
+              exit 0
+            fi
+
+            if [[ "$attempt" == "3" ]]; then
+              echo "Release upload failed after $attempt attempts." >&2
+              exit 1
+            fi
+            sleep $((attempt * 10))
+          done
+
+  publish-release:
+    name: Verify and publish release
+    needs:
+      - prepare-release
+      - build-images
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Verify release assets
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          expected_assets=(
+            "kkFileView-$APP_VERSION-docker_x64.tar"
+            "kkFileView-$APP_VERSION-docker_x64.tar.sha256"
+            "kkFileView-$APP_VERSION-docker_aarch64.tar"
+            "kkFileView-$APP_VERSION-docker_aarch64.tar.sha256"
+          )
+
+          for asset in "${expected_assets[@]}"; do
+            size="$(gh release view "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json assets \
+              --jq ".assets[] | select(.name == \"$asset\") | .size")"
+            if [[ -z "$size" || "$size" == "0" ]]; then
+              echo "Missing or empty release asset: $asset" >&2
+              exit 1
+            fi
+            echo "Verified $asset ($size bytes)."
+          done
+
+      - name: Publish release
+        run: gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false
+
+      - name: Print release URL
+        run: gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json url --jq '.url'
